@@ -154,6 +154,12 @@ func newServer(client genai.Client) http.Handler {
 			slog.Error("Json encoding failed", "error", err)
 		}
 	})
+
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
 	return mux
 }
 
