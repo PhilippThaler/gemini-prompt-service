@@ -16,8 +16,9 @@ import (
 )
 
 type Request struct {
-	Prompt string `json:"prompt"`
-	Model  string `json:"model"`
+	Prompt             string `json:"prompt,omitempty"`
+	Model              string `json:"model,omitempty"`
+	SystemInstructions string `json:"system_instructions,omitempty"`
 }
 
 type Response struct {
@@ -75,8 +76,8 @@ func run() error {
 	return nil
 }
 
-func generateGeminiResponse(ctx context.Context, client *genai.Client, model, prompt string) (Response, error) {
-	result, err := client.Models.GenerateContent(ctx, model, genai.Text(prompt), nil)
+func generateGeminiResponse(ctx context.Context, client *genai.Client, model, prompt string, config genai.GenerateContentConfig) (Response, error) {
+	result, err := client.Models.GenerateContent(ctx, model, genai.Text(prompt), &config)
 	if err != nil {
 		return Response{}, err
 	}
@@ -100,9 +101,16 @@ func newServer(client genai.Client) http.Handler {
 
 	model := os.Getenv("GEMINI_DEFAULT_MODEL")
 	prompt := os.Getenv("GEMINI_DEFAULT_PROMPT")
+	instructions := os.Getenv("GEMINI_DEFAULT_INSTRUCTIONS")
+	var config genai.GenerateContentConfig
 
 	if model == "" {
 		model = "gemini-2.5-flash"
+	}
+	if instructions != "" {
+		config = genai.GenerateContentConfig{
+			SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: instructions}}},
+		}
 	}
 	if prompt == "" {
 		seed := time.Now().Format(time.RFC3339Nano)
@@ -110,7 +118,7 @@ func newServer(client genai.Client) http.Handler {
 	}
 
 	mux.HandleFunc("GET /new", func(w http.ResponseWriter, r *http.Request) {
-		resp, err := generateGeminiResponse(r.Context(), &client, model, prompt)
+		resp, err := generateGeminiResponse(r.Context(), &client, model, prompt, config)
 		if err != nil {
 			slog.Error("Couldn't generate Gemini Response", "error", err, "prompt", prompt)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -137,14 +145,22 @@ func newServer(client genai.Client) http.Handler {
 			return
 		}
 
+		activeInstructions := instructions
+		if req.SystemInstructions != "" {
+			activeInstructions = req.SystemInstructions
+			config = genai.GenerateContentConfig{
+				SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: activeInstructions}}},
+			}
+		}
+
 		activeModel := model
 		if req.Model != "" {
 			activeModel = req.Model
 		}
 
-		resp, err := generateGeminiResponse(r.Context(), &client, activeModel, req.Prompt)
+		resp, err := generateGeminiResponse(r.Context(), &client, activeModel, req.Prompt, config)
 		if err != nil {
-			slog.Error("Couldn't generate Gemini Response", "error", err, "prompt", req.Prompt)
+			slog.Error("Couldn't generate Gemini Response", "error", err, "prompt", req.Prompt, "instructions", req.SystemInstructions)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
