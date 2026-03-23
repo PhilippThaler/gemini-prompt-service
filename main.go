@@ -55,8 +55,11 @@ func run() error {
 	mux := newServer(client)
 
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%s", defaultPort),
-		Handler: mux,
+		Addr:         fmt.Sprintf(":%s", defaultPort),
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	go func() {
@@ -82,12 +85,7 @@ func run() error {
 	return nil
 }
 
-func generateGeminiResponse(ctx context.Context, client *genai.Client, model, prompt string, config *genai.GenerateContentConfig) (Response, error) {
-	result, err := client.Models.GenerateContent(ctx, model, genai.Text(prompt), config)
-	if err != nil {
-		return Response{}, err
-	}
-
+func extractResponseText(result *genai.GenerateContentResponse) string {
 	var responseText strings.Builder
 	for _, candidate := range result.Candidates {
 		if candidate.Content != nil {
@@ -96,9 +94,18 @@ func generateGeminiResponse(ctx context.Context, client *genai.Client, model, pr
 			}
 		}
 	}
+	return responseText.String()
+}
+
+func generateGeminiResponse(ctx context.Context, client *genai.Client, model, prompt string, config *genai.GenerateContentConfig) (Response, error) {
+	result, err := client.Models.GenerateContent(ctx, model, genai.Text(prompt), config)
+	if err != nil {
+		return Response{}, err
+	}
+
 	return Response{
 		Timestamp: time.Now(),
-		Text:      responseText.String(),
+		Text:      extractResponseText(result),
 	}, nil
 }
 
@@ -124,16 +131,7 @@ func generateGeminiModerationResponse(ctx context.Context, client *genai.Client,
 		return ModerationResponse{}, err
 	}
 
-	var responseText strings.Builder
-	for _, candidate := range result.Candidates {
-		if candidate.Content != nil {
-			for _, part := range candidate.Content.Parts {
-				responseText.WriteString(part.Text)
-			}
-		}
-	}
-
-	rawJSON := responseText.String()
+	rawJSON := extractResponseText(result)
 
 	var aiResult struct {
 		IsApproved bool   `json:"is_approved"`
@@ -149,6 +147,30 @@ func generateGeminiModerationResponse(ctx context.Context, client *genai.Client,
 		Reason:     aiResult.Reason,
 	}, nil
 
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+	lrw.statusCode = code
+	lrw.ResponseWriter.WriteHeader(code)
+}
+
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		lrw := &loggingResponseWriter{w, http.StatusOK}
+		next.ServeHTTP(lrw, r)
+		slog.Info("Request Handled",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", lrw.statusCode,
+			"duration", time.Since(start),
+		)
+	})
 }
 
 func newServer(client *genai.Client) http.Handler {
@@ -175,7 +197,10 @@ func newServer(client *genai.Client) http.Handler {
 			}
 		}
 
-		resp, err := generateGeminiResponse(r.Context(), client, defaultModel, activePrompt, config)
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+
+		resp, err := generateGeminiResponse(ctx, client, defaultModel, activePrompt, config)
 		if err != nil {
 			slog.Error("Couldn't generate Gemini Response", "error", err, "prompt", activePrompt)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -219,7 +244,10 @@ func newServer(client *genai.Client) http.Handler {
 			}
 		}
 
-		resp, err := generateGeminiResponse(r.Context(), client, activeModel, req.Prompt, config)
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+
+		resp, err := generateGeminiResponse(ctx, client, activeModel, req.Prompt, config)
 		if err != nil {
 			slog.Error("Couldn't generate Gemini Response", "error", err, "prompt", req.Prompt, "instructions", req.SystemInstructions)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -251,7 +279,10 @@ func newServer(client *genai.Client) http.Handler {
 			activeModel = req.Model
 		}
 
-		resp, err := generateGeminiModerationResponse(r.Context(), client, activeModel, req.Prompt)
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+
+		resp, err := generateGeminiModerationResponse(ctx, client, activeModel, req.Prompt)
 		if err != nil {
 			slog.Error("Couldn't generate Gemini Response", "error", err, "prompt", req.Prompt)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -269,7 +300,7 @@ func newServer(client *genai.Client) http.Handler {
 		w.Write([]byte("OK"))
 	})
 
-	return mux
+	return loggingMiddleware(mux)
 }
 
 func main() {
